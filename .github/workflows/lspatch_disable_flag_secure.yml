@@ -12,7 +12,6 @@ on:
         required: false
       download_source:
         description: "APK download source (apk-pure, f-droid, huawei-app-gallery)"
-        default: "apk-pure"
         required: false
       signture_bypass:
         description: "Signature bypass level [default: 0]"
