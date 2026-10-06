@@ -52,7 +52,7 @@ jobs:
           INJECTDEX="${{ github.event.inputs.injectdex }}"
           BASENAME="patched"
 
-          # 1. Download LSPatch
+          # 1. Download LSPatch (handling pre-releases)
           LSPATCH_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/JingMatrix/LSPatch/releases \
             | jq -r '.[0].assets[] | select(.name | test(".*\\.jar$")) | .browser_download_url' | head -n 1)
@@ -64,14 +64,82 @@ jobs:
             | jq -r '.[0].assets[] | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$")) | .browser_download_url' | head -n 1)
           wget -O Xposed-Disable-FLAG_SECURE.apk "$MODULE_URL"
 
-          # 3. Build Module 2: Disable Lifecycle / Anti-Exit APK on the fly
-          echo "Building anti-exit Xposed module..."
+          # 3. Build Module 2: Anti-Exit Xposed Module
+          echo "Setting up anti-exit build environment..."
           mkdir -p xposed_build/src/com/bypass/lifecycle
           mkdir -p xposed_build/assets
           mkdir -p xposed_build/bin
+          mkdir -p xposed_build/stubs/de/robv/android/xposed/callbacks
 
           echo "com.bypass.lifecycle.HookInit" > xposed_build/assets/xposed_init
 
+          # Create compile-time Xposed stubs (zero network downloads required)
+          cat << 'EOF' > xposed_build/stubs/de/robv/android/xposed/callbacks/XC_LoadPackage.java
+          package de.robv.android.xposed.callbacks;
+          public class XC_LoadPackage {
+              public static class LoadPackageParam {
+                  public String packageName;
+                  public ClassLoader classLoader;
+              }
+          }
+          EOF
+
+          cat << 'EOF' > xposed_build/stubs/de/robv/android/xposed/IXposedHookLoadPackage.java
+          package de.robv.android.xposed;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
+          public interface IXposedHookLoadPackage {
+              void handleLoadPackage(LoadPackageParam lpparam) throws Throwable;
+          }
+          EOF
+
+          cat << 'EOF' > xposed_build/stubs/de/robv/android/xposed/XC_MethodHook.java
+          package de.robv.android.xposed;
+          public abstract class XC_MethodHook {
+              public static class MethodHookParam {
+                  public Object[] args;
+                  public Object thisObject;
+                  public Object result;
+                  public Throwable throwable;
+                  public Object getResult() { return result; }
+                  public void setResult(Object result) { this.result = result; }
+              }
+              public static class Unhook {}
+              protected void beforeHookedMethod(MethodHookParam param) throws Throwable {}
+              protected void afterHookedMethod(MethodHookParam param) throws Throwable {}
+          }
+          EOF
+
+          cat << 'EOF' > xposed_build/stubs/de/robv/android/xposed/XC_MethodReplacement.java
+          package de.robv.android.xposed;
+          public abstract class XC_MethodReplacement extends XC_MethodHook {
+              public static final XC_MethodReplacement DO_NOTHING = new XC_MethodReplacement() {
+                  @Override
+                  protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
+                      return null;
+                  }
+              };
+              @Override
+              protected final void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                  try {
+                      param.setResult(replaceHookedMethod(param));
+                  } catch (Throwable t) {
+                      param.throwable = t;
+                  }
+              }
+              protected abstract Object replaceHookedMethod(MethodHookParam param) throws Throwable;
+          }
+          EOF
+
+          cat << 'EOF' > xposed_build/stubs/de/robv/android/xposed/XposedHelpers.java
+          package de.robv.android.xposed;
+          public class XposedHelpers {
+              public static Class<?> findClassIfExists(String className, ClassLoader classLoader) { return null; }
+              public static XC_MethodHook.Unhook findAndHookMethod(Class<?> clazz, String methodName, Object... parameterTypesAndCallback) { return null; }
+              public static XC_MethodHook.Unhook findAndHookMethod(String className, ClassLoader classLoader, String methodName, Object... parameterTypesAndCallback) { return null; }
+          }
+          EOF
+
+          # Hook implementation
           cat << 'EOF' > xposed_build/src/com/bypass/lifecycle/HookInit.java
           package com.bypass.lifecycle;
 
@@ -86,7 +154,7 @@ jobs:
               public void handleLoadPackage(final LoadPackageParam lpparam) throws Throwable {
                   if (!lpparam.packageName.equals("com.gobimbel_online")) return;
 
-                  // Prevent Flutter from sending pause/inactive lifecycle notifications to Dart
+                  // Block Flutter engine lifecycle pause/inactive events
                   Class<?> lifecycleChannel = XposedHelpers.findClassIfExists(
                       "io.flutter.embedding.engine.systemchannels.LifecycleChannel", 
                       lpparam.classLoader
@@ -98,7 +166,7 @@ jobs:
                       XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsDetached", XC_MethodReplacement.DO_NOTHING);
                   }
 
-                  // Force Android Activity to always report window focus as true
+                  // Force Android Activity window focus to stay active
                   XposedHelpers.findAndHookMethod(
                       "android.app.Activity", 
                       lpparam.classLoader, 
@@ -112,7 +180,7 @@ jobs:
                       }
                   );
 
-                  // Block user leave hint (triggered by Home button or app switcher)
+                  // Suppress onUserLeaveHint
                   XposedHelpers.findAndHookMethod(
                       "android.app.Activity", 
                       lpparam.classLoader, 
@@ -135,27 +203,27 @@ jobs:
           </manifest>
           EOF
 
-          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
-          PLATFORM_JAR=$(ls -d $ANDROID_HOME/platforms/android-* | sort -V | tail -n 1)/android.jar
-          wget -qO xposed-api.jar https://repo.maven.apache.org/maven2/de/robv/android/xposed/api/82/api-82.jar
+          # Select stable Android 34 build-tools and platform
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+          PLATFORM_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
 
-          # Compile Java targeting Java 8 bytecode
-          javac -cp "$PLATFORM_JAR:xposed-api.jar" -source 8 -target 8 -d xposed_build/bin xposed_build/src/com/bypass/lifecycle/HookInit.java
+          # 1. Compile stubs
+          mkdir -p xposed_build/stub_bin
+          javac -source 8 -target 8 -d xposed_build/stub_bin $(find xposed_build/stubs -name "*.java")
 
-          # Convert to DEX using d8
-          $BUILD_TOOLS/d8 xposed_build/bin/com/bypass/lifecycle/*.class --output xposed_build/bin/
+          # 2. Compile HookInit against stubs + android.jar
+          javac -source 8 -target 8 -cp "$PLATFORM_JAR:xposed_build/stub_bin" -d xposed_build/bin xposed_build/src/com/bypass/lifecycle/HookInit.java
 
-          # Package APK and add resources
-          if [ -f "$BUILD_TOOLS/aapt" ]; then
-            $BUILD_TOOLS/aapt package -F xposed_build/module_unaligned.apk -M xposed_build/AndroidManifest.xml -I "$PLATFORM_JAR" -f
-          else
-            $BUILD_TOOLS/aapt2 link -I "$PLATFORM_JAR" --manifest xposed_build/AndroidManifest.xml -o xposed_build/module_unaligned.apk
-          fi
+          # 3. Dex only HookInit (stubs are omitted from dex)
+          $BUILD_TOOLS/d8 --lib "$PLATFORM_JAR" xposed_build/bin/com/bypass/lifecycle/*.class --output xposed_build/bin/
 
-          cd xposed_build/bin && zip -u ../module_unaligned.apk classes.dex && cd ../..
-          cd xposed_build && zip -u -r module_unaligned.apk assets/ && cd ..
+          # 4. Package APK
+          $BUILD_TOOLS/aapt package -F xposed_build/module_unaligned.apk -M xposed_build/AndroidManifest.xml -I "$PLATFORM_JAR" -f
+          (cd xposed_build/bin && zip -u ../module_unaligned.apk classes.dex)
+          (cd xposed_build && zip -u -r module_unaligned.apk assets/)
 
-          # Sign module APK
+          # 5. Sign module APK
+          rm -f debug.keystore
           keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias debug -dname "CN=Debug" -validity 10000 -keyalg RSA -keysize 2048
           $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --out disable_lifecycle.apk xposed_build/module_unaligned.apk
 
