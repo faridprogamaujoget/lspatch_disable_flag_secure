@@ -86,8 +86,10 @@ jobs:
             SRC="${DOWNLOAD_SOURCE:-apk-pure}"
             echo "Fetching $APP_ID from source:$SRC"
 
-            export APKEEP_APKPURE_DANGERS_ACKNOWLEDGED=true
-            export APKPURE_DANGERS_ACKNOWLEDGED=true
+            EXTRA_OPTS=""
+            if [ "$SRC" = "apk-pure" ]; then
+              EXTRA_OPTS="-o acknowledge_dangers=true"
+            fi
 
             ./apkeep -a "$APP_ID" -d "$SRC" ./apk_download
             FILE=$(ls apk_download | head -n 1)
