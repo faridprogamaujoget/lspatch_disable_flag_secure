@@ -10,20 +10,7 @@ on:
         description: "Direct APK download link (only if you don't use package name)"
         required: false
       download_source:
-        description: "APK download source"
-        required: false
-        default: "google-play"
-        type: choice
-        options:
-          - "google-play"
-          - "apk-pure"
-          - "f-droid"
-          - "huawei-app-gallery"
-      gplay_email:
-        description: "Google Account Email (required if using google-play)"
-        required: false
-      oauth_token:
-        description: "One-time OAuth Token (oauth2_4/...)"
+        description: "APK download source (apk-pure, f-droid, huawei-app-gallery)"
         required: false
       signture_bypass:
         description: "Signature bypass level (increase if apk has protection) [default: 0]"
@@ -59,8 +46,6 @@ jobs:
           APP_ID="${{ github.event.inputs.app_id }}"
           APK_URL="${{ github.event.inputs.apk_url }}"
           DOWNLOAD_SOURCE="${{ github.event.inputs.download_source }}"
-          GPLAY_EMAIL="${{ github.event.inputs.gplay_email }}"
-          OAUTH_TOKEN="${{ github.event.inputs.oauth_token }}"
           SIGNTURE_BYPASS="${{ github.event.inputs.signture_bypass }}"
           INJECTDEX="${{ github.event.inputs.injectdex }}"
           BASENAME="patched"
@@ -86,18 +71,12 @@ jobs:
 
           # 4. Download Target APK
           mkdir -p apk_download
-          DOWNLOAD_SOURCE="${DOWNLOAD_SOURCE:-google-play}"
-
-          if [ "$DOWNLOAD_SOURCE" = "google-play" ] && [ -n "$OAUTH_TOKEN" ]; then
-            echo "Exchanging one-time OAuth token for AAS session token..."
-            RAW_TOKEN=$(./apkeep -e "$GPLAY_EMAIL" --oauth-token "$OAUTH_TOKEN")
-            AAS_TOKEN=$(echo "$RAW_TOKEN" | grep -oE 'aas_et/[^[:space:]]+' || echo "$RAW_TOKEN" | tail -n 1 | tr -d '[:space:]')
-
-            ./apkeep -a "$APP_ID" -d google-play -e "$GPLAY_EMAIL" -t "$AAS_TOKEN" ./apk_download
-            FILE=$(ls apk_download | head -n 1)
-            BASENAME="${FILE%.*}"
-          elif [ -n "$APP_ID" ]; then
-            ./apkeep -a "$APP_ID" -d "$DOWNLOAD_SOURCE" ./apk_download
+          if [ -n "$APP_ID" ]; then
+            if [ -n "$DOWNLOAD_SOURCE" ]; then
+              ./apkeep -a "$APP_ID" -d "$DOWNLOAD_SOURCE" ./apk_download
+            else
+              ./apkeep -a "$APP_ID" ./apk_download
+            fi
             FILE=$(ls apk_download | head -n 1)
             BASENAME="${FILE%.*}"
           elif [ -n "$APK_URL" ]; then
@@ -112,41 +91,29 @@ jobs:
           mkdir -p work_apks raw_extracted
           for item in apk_download/*; do
             if [ -f "$item" ]; then
-              case "$item" in
-                *.xapk|*.apks|*.zip)
-                  unzip -qo "$item" -d raw_extracted/
-                  find raw_extracted/ -type f -name "*.apk" -exec mv {} work_apks/ \;
-                  ;;
-                *.apk)
-                  cp "$item" work_apks/
-                  ;;
-              esac
+              if unzip -l "$item" 2>/dev/null | grep -q '\.apk$'; then
+                unzip -qo "$item" -d raw_extracted/
+                find raw_extracted/ -type f -name "*.apk" -exec mv {} work_apks/ \;
+              elif [[ "$item" == *.apk ]] || unzip -l "$item" 2>/dev/null | grep -q "AndroidManifest.xml"; then
+                cp "$item" work_apks/
+              fi
             fi
           done
 
-          APK_COUNT=$(find work_apks/ -maxdepth 1 -name "*.apk" | wc -l)
+          APK_COUNT=$(ls work_apks/*.apk 2>/dev/null | wc -l)
           if [ "$APK_COUNT" -eq 1 ]; then
             cp work_apks/*.apk main.apk
-          elif [ "$APK_COUNT" -gt 1 ]; then
+          else
             APKEDITOR_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               https://api.github.com/repos/REAndroid/APKEditor/releases \
               | jq -r '.[0].assets[] | select(.name | test("^APKEditor-.*\\.jar$")) | .browser_download_url' | head -n 1)
             wget -O APKEditor.jar "$APKEDITOR_URL"
             java -jar APKEditor.jar m -i work_apks -o main.apk
-          else
-            echo "Error: No APK files found in work_apks directory."
-            exit 1
           fi
 
           # 6. Build the Lifecycle Hook Xposed Module inline
           echo "=== Building Lifecycle Hook Module ==="
-          curl -fSL -A "Mozilla/5.0" \
-            "https://jcenter.bintray.com/de/robv/android/xposed/api/82/api-82.jar" \
-            -o api-82.jar || \
-          curl -fSL -A "Mozilla/5.0" \
-            "https://maven.aliyun.com/repository/public/de/robv/android/xposed/api/82/api-82.jar" \
-            -o api-82.jar
-
+          wget -q -O api-82.jar "https://repo1.maven.org/maven2/de/robv/android/xposed/api/82/api-82.jar"
           ANDROID_JAR=$(ls -d $ANDROID_HOME/platforms/android-*/android.jar | sort -V | tail -n 1)
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
 
