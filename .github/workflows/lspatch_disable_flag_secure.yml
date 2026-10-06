@@ -1,19 +1,21 @@
-name: Rebuild APK with Disable FLAG_SECURE
+name: Rebuild APK with Disable FLAG_SECURE and Anti-Exit
 
 on:
   workflow_dispatch:
     inputs:
       app_id:
-        description: "Android app package (e.g. com.instagram.android or com.app@version)"
+        description: "Android app package (e.g. com.gobimbel_online)"
+        default: "com.gobimbel_online"
         required: false
       apk_url:
-        description: "Direct APK download link (only if you don't use package name)"
+        description: "Direct APK download link (leave empty if using package name)"
         required: false
       download_source:
         description: "APK download source (apk-pure, f-droid, huawei-app-gallery)"
+        default: "apk-pure"
         required: false
       signture_bypass:
-        description: "Signature bypass level (increase if apk has protection) [default: 0]"
+        description: "Signature bypass level [default: 0]"
         default: "0"
         type: choice
         options:
@@ -21,7 +23,7 @@ on:
           - "1"
           - "2"
       injectdex:
-        description: "Inject dex directly (useful if apk is browser)"
+        description: "Inject dex directly"
         default: false
         type: boolean
 
@@ -37,7 +39,7 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Build
+      - name: Build and Patch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -50,37 +52,120 @@ jobs:
           INJECTDEX="${{ github.event.inputs.injectdex }}"
           BASENAME="patched"
 
-          # 1. Fetch LSPatch
+          # 1. Download LSPatch
           LSPATCH_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/JingMatrix/LSPatch/releases \
             | jq -r '.[0].assets[] | select(.name | test(".*\\.jar$")) | .browser_download_url' | head -n 1)
-
-          if [ -z "$LSPATCH_URL" ] || [ "$LSPATCH_URL" = "null" ]; then
-            echo "Failed to resolve LSPATCH_URL"
-            exit 1
-          fi
           wget -O lspatch.jar "$LSPATCH_URL"
 
-          # 2. Fetch Xposed Disable FLAG_SECURE Module
+          # 2. Download Module 1: Disable FLAG_SECURE
           MODULE_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/Xposed-Modules-Repo/com.varuns2002.disable_flag_secure/releases \
             | jq -r '.[0].assets[] | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$")) | .browser_download_url' | head -n 1)
-
-          if [ -z "$MODULE_URL" ] || [ "$MODULE_URL" = "null" ]; then
-            echo "Failed to resolve MODULE_URL"
-            exit 1
-          fi
           wget -O Xposed-Disable-FLAG_SECURE.apk "$MODULE_URL"
 
-          # 3. Fetch apkeep
+          # 3. Build Module 2: Disable Lifecycle / Anti-Exit APK on the fly
+          echo "Building anti-exit Xposed module..."
+          mkdir -p xposed_build/src/com/bypass/lifecycle
+          mkdir -p xposed_build/assets
+          mkdir -p xposed_build/bin
+
+          echo "com.bypass.lifecycle.HookInit" > xposed_build/assets/xposed_init
+
+          cat << 'EOF' > xposed_build/src/com/bypass/lifecycle/HookInit.java
+          package com.bypass.lifecycle;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XC_MethodReplacement;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
+
+          public class HookInit implements IXposedHookLoadPackage {
+              @Override
+              public void handleLoadPackage(final LoadPackageParam lpparam) throws Throwable {
+                  if (!lpparam.packageName.equals("com.gobimbel_online")) return;
+
+                  // Prevent Flutter from sending pause/inactive lifecycle notifications to Dart
+                  Class<?> lifecycleChannel = XposedHelpers.findClassIfExists(
+                      "io.flutter.embedding.engine.systemchannels.LifecycleChannel", 
+                      lpparam.classLoader
+                  );
+                  if (lifecycleChannel != null) {
+                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsInactive", XC_MethodReplacement.DO_NOTHING);
+                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsPaused", XC_MethodReplacement.DO_NOTHING);
+                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsHidden", XC_MethodReplacement.DO_NOTHING);
+                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsDetached", XC_MethodReplacement.DO_NOTHING);
+                  }
+
+                  // Force Android Activity to always report window focus as true
+                  XposedHelpers.findAndHookMethod(
+                      "android.app.Activity", 
+                      lpparam.classLoader, 
+                      "onWindowFocusChanged", 
+                      boolean.class, 
+                      new XC_MethodHook() {
+                          @Override
+                          protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                              param.args[0] = true;
+                          }
+                      }
+                  );
+
+                  // Block user leave hint (triggered by Home button or app switcher)
+                  XposedHelpers.findAndHookMethod(
+                      "android.app.Activity", 
+                      lpparam.classLoader, 
+                      "onUserLeaveHint", 
+                      XC_MethodReplacement.DO_NOTHING
+                  );
+              }
+          }
+          EOF
+
+          cat << 'EOF' > xposed_build/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.bypass.lifecycle">
+              <application android:label="Disable Lifecycle">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="Prevents exit detection" />
+                  <meta-data android:name="xposedminversion" android:value="54" />
+              </application>
+          </manifest>
+          EOF
+
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          PLATFORM_JAR=$(ls -d $ANDROID_HOME/platforms/android-* | sort -V | tail -n 1)/android.jar
+          wget -qO xposed-api.jar https://repo.maven.apache.org/maven2/de/robv/android/xposed/api/82/api-82.jar
+
+          # Compile Java targeting Java 8 bytecode
+          javac -cp "$PLATFORM_JAR:xposed-api.jar" -source 8 -target 8 -d xposed_build/bin xposed_build/src/com/bypass/lifecycle/HookInit.java
+
+          # Convert to DEX using d8
+          $BUILD_TOOLS/d8 xposed_build/bin/com/bypass/lifecycle/*.class --output xposed_build/bin/
+
+          # Package APK and add resources
+          if [ -f "$BUILD_TOOLS/aapt" ]; then
+            $BUILD_TOOLS/aapt package -F xposed_build/module_unaligned.apk -M xposed_build/AndroidManifest.xml -I "$PLATFORM_JAR" -f
+          else
+            $BUILD_TOOLS/aapt2 link -I "$PLATFORM_JAR" --manifest xposed_build/AndroidManifest.xml -o xposed_build/module_unaligned.apk
+          fi
+
+          cd xposed_build/bin && zip -u ../module_unaligned.apk classes.dex && cd ../..
+          cd xposed_build && zip -u -r module_unaligned.apk assets/ && cd ..
+
+          # Sign module APK
+          keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias debug -dname "CN=Debug" -validity 10000 -keyalg RSA -keysize 2048
+          $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --out disable_lifecycle.apk xposed_build/module_unaligned.apk
+
+          # 4. Download Target Package
           APKEEP_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/EFForg/apkeep/releases/latest \
             | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url' | head -n 1)
-
           wget -O apkeep "$APKEEP_URL"
           chmod +x apkeep
 
-          # 4. Download Target Package
           mkdir -p apk_download
           if [ -n "$APP_ID" ]; then
             if [ -n "$DOWNLOAD_SOURCE" ]; then
@@ -98,37 +183,23 @@ jobs:
             exit 1
           fi
 
-          if [ ! "$(ls -A apk_download)" ]; then
-            echo "apk_download directory is empty"
-            exit 1
-          fi
-
-          # 5. Extract containers and merge split APKs
+          # 5. Extract XAPK/APKS and merge if needed
           mkdir -p work_apks raw_extracted
           for item in apk_download/*; do
             if [ -f "$item" ]; then
               if unzip -l "$item" 2>/dev/null | grep -q '\.apk$'; then
-                echo "Unpacking APK container: $item"
                 unzip -qo "$item" -d raw_extracted/
                 find raw_extracted/ -type f -name "*.apk" -exec mv {} work_apks/ \;
               elif [[ "$item" == *.apk ]] || unzip -l "$item" 2>/dev/null | grep -q "AndroidManifest.xml"; then
-                echo "Discovered standalone APK: $item"
                 cp "$item" work_apks/
               fi
             fi
           done
 
           APK_COUNT=$(ls work_apks/*.apk 2>/dev/null | wc -l)
-          echo "Discovered $APK_COUNT APK file(s)"
-
-          if [ "$APK_COUNT" -eq 0 ]; then
-            echo "Error: No APK files found"
-            exit 1
-          elif [ "$APK_COUNT" -eq 1 ]; then
-            echo "Single APK detected; skipping merge"
+          if [ "$APK_COUNT" -eq 1 ]; then
             cp work_apks/*.apk main.apk
           else
-            echo "Split APK detected; merging with APKEditor..."
             APKEDITOR_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               https://api.github.com/repos/REAndroid/APKEditor/releases \
               | jq -r '.[0].assets[] | select(.name | test("^APKEditor-.*\\.jar$")) | .browser_download_url' | head -n 1)
@@ -136,142 +207,7 @@ jobs:
             java -jar APKEditor.jar m -i work_apks -o main.apk
           fi
 
-          # 6. Build the Lifecycle Hook Xposed Module inline (offline stubs)
-          echo "=== Building Lifecycle Hook Module ==="
-          ANDROID_JAR=$(ls -d $ANDROID_HOME/platforms/android-*/android.jar | sort -V | tail -n 1)
-          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
-
-          # Local Xposed compile stubs
-          mkdir -p stub_src/de/robv/android/xposed/callbacks stub_bin
-          cat << 'EOF' > stub_src/de/robv/android/xposed/callbacks/XC_LoadPackage.java
-          package de.robv.android.xposed.callbacks;
-          public class XC_LoadPackage {
-              public static class LoadPackageParam {
-                  public String packageName;
-                  public ClassLoader classLoader;
-              }
-          }
-          EOF
-
-          cat << 'EOF' > stub_src/de/robv/android/xposed/IXposedHookLoadPackage.java
-          package de.robv.android.xposed;
-          import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
-          public interface IXposedHookLoadPackage {
-              void handleLoadPackage(LoadPackageParam lpparam) throws Throwable;
-          }
-          EOF
-
-          cat << 'EOF' > stub_src/de/robv/android/xposed/XC_MethodHook.java
-          package de.robv.android.xposed;
-          public abstract class XC_MethodHook {
-              public static class MethodHookParam {
-                  public Object[] args;
-              }
-              protected void beforeHookedMethod(MethodHookParam param) throws Throwable {}
-              protected void afterHookedMethod(MethodHookParam param) throws Throwable {}
-              public static class Unhook {}
-          }
-          EOF
-
-          cat << 'EOF' > stub_src/de/robv/android/xposed/XC_MethodReplacement.java
-          package de.robv.android.xposed;
-          public abstract class XC_MethodReplacement extends XC_MethodHook {
-              public static final XC_MethodReplacement DO_NOTHING = new XC_MethodReplacement() {};
-          }
-          EOF
-
-          cat << 'EOF' > stub_src/de/robv/android/xposed/XposedHelpers.java
-          package de.robv.android.xposed;
-          public class XposedHelpers {
-              public static Class<?> findClassIfExists(String className, ClassLoader classLoader) { return null; }
-              public static XC_MethodHook.Unhook findAndHookMethod(Class<?> clazz, String methodName, Object... parameterTypesAndCallback) { return null; }
-              public static XC_MethodHook.Unhook findAndHookMethod(String className, ClassLoader classLoader, String methodName, Object... parameterTypesAndCallback) { return null; }
-          }
-          EOF
-
-          javac -d stub_bin stub_src/de/robv/android/xposed/*.java stub_src/de/robv/android/xposed/callbacks/*.java
-          jar cf xposed_stub.jar -C stub_bin .
-
-          # Write module source code
-          mkdir -p mod_src/com/bypass/lifecycle mod_bin assets
-          cat << 'EOF' > mod_src/com/bypass/lifecycle/HookInit.java
-          package com.bypass.lifecycle;
-
-          import de.robv.android.xposed.IXposedHookLoadPackage;
-          import de.robv.android.xposed.XC_MethodHook;
-          import de.robv.android.xposed.XC_MethodReplacement;
-          import de.robv.android.xposed.XposedHelpers;
-          import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
-
-          public class HookInit implements IXposedHookLoadPackage {
-              @Override
-              public void handleLoadPackage(final LoadPackageParam lpparam) throws Throwable {
-                  if (!lpparam.packageName.equals("com.gobimbel_online")) return;
-
-                  // Hook Flutter lifecycle channel to keep engine in resumed state
-                  Class<?> lifecycleChannel = XposedHelpers.findClassIfExists(
-                      "io.flutter.embedding.engine.systemchannels.LifecycleChannel", 
-                      lpparam.classLoader
-                  );
-                  if (lifecycleChannel != null) {
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsInactive", XC_MethodReplacement.DO_NOTHING);
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsPaused", XC_MethodReplacement.DO_NOTHING);
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsHidden", XC_MethodReplacement.DO_NOTHING);
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsDetached", XC_MethodReplacement.DO_NOTHING);
-                  }
-
-                  // Force Activity window focus to always report true
-                  XposedHelpers.findAndHookMethod(
-                      "android.app.Activity", 
-                      lpparam.classLoader, 
-                      "onWindowFocusChanged", 
-                      boolean.class, 
-                      new XC_MethodHook() {
-                          @Override
-                          protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                              param.args[0] = true;
-                          }
-                      }
-                  );
-
-                  // Prevent user leave callback (home button / recents gestures)
-                  XposedHelpers.findAndHookMethod(
-                      "android.app.Activity", 
-                      lpparam.classLoader, 
-                      "onUserLeaveHint", 
-                      XC_MethodReplacement.DO_NOTHING
-                  );
-              }
-          }
-          EOF
-
-          cat << 'EOF' > mod_manifest.xml
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.bypass.lifecycle">
-              <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34"/>
-              <application android:label="Lifecycle Hook">
-                  <meta-data android:name="xposedmodule" android:value="true"/>
-                  <meta-data android:name="xposeddescription" android:value="Disable lifecycle detection"/>
-                  <meta-data android:name="xposedminversion" android:value="53"/>
-              </application>
-          </manifest>
-          EOF
-
-          # Compile HookInit against stubs and dexify
-          javac -cp "$ANDROID_JAR:xposed_stub.jar" -source 8 -target 8 -d mod_bin mod_src/com/bypass/lifecycle/HookInit.java
-          $BUILD_TOOLS/d8 --output . mod_bin/com/bypass/lifecycle/*.class
-
-          # Package APK and register assets/xposed_init entrypoint
-          $BUILD_TOOLS/aapt2 link -o mod_base.apk -I "$ANDROID_JAR" --manifest mod_manifest.xml
-          echo "com.bypass.lifecycle.HookInit" > assets/xposed_init
-          zip -u mod_base.apk assets/xposed_init classes.dex
-
-          # Sign module APK
-          keytool -genkeypair -alias debug -keypass android -keystore debug.keystore -storepass android -dname "CN=Debug" -validity 10000 -keyalg RSA -keysize 2048
-          $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --out LifecycleHook.apk mod_base.apk
-          rm -f classes.dex
-
-          # 7. Run LSPatch with both modules
+          # 6. Apply LSPatch with BOTH modules
           mkdir -p lspatch
           INJECT_FLAG=""
           if [ "$INJECTDEX" = "true" ]; then
@@ -281,11 +217,10 @@ jobs:
           java -jar lspatch.jar \
             -l "$SIGNTURE_BYPASS" \
             -m Xposed-Disable-FLAG_SECURE.apk \
-            -m LifecycleHook.apk \
+            -m disable_lifecycle.apk \
             $INJECT_FLAG \
             -o lspatch main.apk
 
-          # 8. Rename output
           OUTPUT_FILE=$(ls lspatch/*.apk | head -n 1)
           mv "$OUTPUT_FILE" "lspatch/${BASENAME}_patched.apk"
 
