@@ -112,24 +112,30 @@ jobs:
           mkdir -p work_apks raw_extracted
           for item in apk_download/*; do
             if [ -f "$item" ]; then
-              if unzip -l "$item" 2>/dev/null | grep -q '\.apk$'; then
-                unzip -qo "$item" -d raw_extracted/
-                find raw_extracted/ -type f -name "*.apk" -exec mv {} work_apks/ \;
-              elif [[ "$item" == *.apk ]] || unzip -l "$item" 2>/dev/null | grep -q "AndroidManifest.xml"; then
-                cp "$item" work_apks/
-              fi
+              case "$item" in
+                *.xapk|*.apks|*.zip)
+                  unzip -qo "$item" -d raw_extracted/
+                  find raw_extracted/ -type f -name "*.apk" -exec mv {} work_apks/ \;
+                  ;;
+                *.apk)
+                  cp "$item" work_apks/
+                  ;;
+              esac
             fi
           done
 
-          APK_COUNT=$(ls work_apks/*.apk 2>/dev/null | wc -l)
+          APK_COUNT=$(find work_apks/ -maxdepth 1 -name "*.apk" | wc -l)
           if [ "$APK_COUNT" -eq 1 ]; then
             cp work_apks/*.apk main.apk
-          else
+          elif [ "$APK_COUNT" -gt 1 ]; then
             APKEDITOR_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               https://api.github.com/repos/REAndroid/APKEditor/releases \
               | jq -r '.[0].assets[] | select(.name | test("^APKEditor-.*\\.jar$")) | .browser_download_url' | head -n 1)
             wget -O APKEditor.jar "$APKEDITOR_URL"
             java -jar APKEditor.jar m -i work_apks -o main.apk
+          else
+            echo "Error: No APK files found in work_apks directory."
+            exit 1
           fi
 
           # 6. Build the Lifecycle Hook Xposed Module inline
@@ -154,7 +160,6 @@ jobs:
               public void handleLoadPackage(final LoadPackageParam lpparam) throws Throwable {
                   if (!lpparam.packageName.equals("com.gobimbel_online")) return;
 
-                  // Hook Flutter lifecycle channel to keep engine in resumed state
                   Class<?> lifecycleChannel = XposedHelpers.findClassIfExists(
                       "io.flutter.embedding.engine.systemchannels.LifecycleChannel", 
                       lpparam.classLoader
@@ -166,7 +171,6 @@ jobs:
                       XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsDetached", XC_MethodReplacement.DO_NOTHING);
                   }
 
-                  // Force Activity window focus to always report true
                   XposedHelpers.findAndHookMethod(
                       "android.app.Activity", 
                       lpparam.classLoader, 
@@ -180,7 +184,6 @@ jobs:
                       }
                   );
 
-                  // Prevent user leave callback (home button / recents gestures)
                   XposedHelpers.findAndHookMethod(
                       "android.app.Activity", 
                       lpparam.classLoader, 
@@ -202,11 +205,9 @@ jobs:
           </manifest>
           EOF
 
-          # Compile Java -> Dex
           javac -cp "$ANDROID_JAR:api-82.jar" -source 8 -target 8 -d mod_bin mod_src/com/bypass/lifecycle/HookInit.java
           $BUILD_TOOLS/d8 --output . mod_bin/com/bypass/lifecycle/*.class
 
-          # Package and sign the module APK
           $BUILD_TOOLS/aapt2 link -o mod_base.apk -I "$ANDROID_JAR" --manifest mod_manifest.xml
           zip -uj mod_base.apk classes.dex
           echo "com.bypass.lifecycle.HookInit" > mod_assets/xposed_init
