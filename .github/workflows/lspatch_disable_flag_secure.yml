@@ -54,29 +54,38 @@ jobs:
           LSPATCH_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/JingMatrix/LSPatch/releases \
             | jq -r '.[0].assets[] | select(.name | test(".*\\.jar$")) | .browser_download_url' | head -n 1)
+
+          if [ -z "$LSPATCH_URL" ] || [ "$LSPATCH_URL" = "null" ]; then
+            echo "Failed to resolve LSPATCH_URL"
+            exit 1
+          fi
           wget -O lspatch.jar "$LSPATCH_URL"
 
           # 2. Fetch Xposed Disable FLAG_SECURE Module
           MODULE_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/Xposed-Modules-Repo/com.varuns2002.disable_flag_secure/releases \
             | jq -r '.[0].assets[] | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$")) | .browser_download_url' | head -n 1)
+
+          if [ -z "$MODULE_URL" ] || [ "$MODULE_URL" = "null" ]; then
+            echo "Failed to resolve MODULE_URL"
+            exit 1
+          fi
           wget -O Xposed-Disable-FLAG_SECURE.apk "$MODULE_URL"
 
           # 3. Fetch apkeep
           APKEEP_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/EFForg/apkeep/releases/latest \
             | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url' | head -n 1)
+
           wget -O apkeep "$APKEEP_URL"
           chmod +x apkeep
 
           # 4. Download Target APK
           mkdir -p apk_download
           if [ -n "$APP_ID" ]; then
-            if [ -n "$DOWNLOAD_SOURCE" ]; then
-              ./apkeep -a "$APP_ID" -d "$DOWNLOAD_SOURCE" ./apk_download
-            else
-              ./apkeep -a "$APP_ID" ./apk_download
-            fi
+            SRC="${DOWNLOAD_SOURCE:-apk-pure}"
+            echo "Fetching $APP_ID from source: $SRC"
+            ./apkeep --accept-danger-warning -a "$APP_ID" -d "$SRC" ./apk_download
             FILE=$(ls apk_download | head -n 1)
             BASENAME="${FILE%.*}"
           elif [ -n "$APK_URL" ]; then
@@ -84,6 +93,11 @@ jobs:
             BASENAME="app"
           else
             echo "No input provided"
+            exit 1
+          fi
+
+          if [ ! "$(ls -A apk_download)" ]; then
+            echo "apk_download directory is empty"
             exit 1
           fi
 
@@ -101,7 +115,10 @@ jobs:
           done
 
           APK_COUNT=$(ls work_apks/*.apk 2>/dev/null | wc -l)
-          if [ "$APK_COUNT" -eq 1 ]; then
+          if [ "$APK_COUNT" -eq 0 ]; then
+            echo "No valid APK files found in download"
+            exit 1
+          elif [ "$APK_COUNT" -eq 1 ]; then
             cp work_apks/*.apk main.apk
           else
             APKEDITOR_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -181,11 +198,9 @@ jobs:
           </manifest>
           EOF
 
-          # Compile Java -> Dex
           javac -cp "$ANDROID_JAR:api-82.jar" -source 8 -target 8 -d mod_bin mod_src/com/bypass/lifecycle/HookInit.java
           $BUILD_TOOLS/d8 --output . mod_bin/com/bypass/lifecycle/*.class
 
-          # Package and sign the module APK
           $BUILD_TOOLS/aapt2 link -o mod_base.apk -I "$ANDROID_JAR" --manifest mod_manifest.xml
           zip -uj mod_base.apk classes.dex
           echo "com.bypass.lifecycle.HookInit" > mod_assets/xposed_init
