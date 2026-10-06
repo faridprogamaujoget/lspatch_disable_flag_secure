@@ -140,7 +140,13 @@ jobs:
 
           # 6. Build the Lifecycle Hook Xposed Module inline
           echo "=== Building Lifecycle Hook Module ==="
-          wget -q -O api-82.jar "https://repo1.maven.org/maven2/de/robv/android/xposed/api/82/api-82.jar"
+          curl -fSL -A "Mozilla/5.0" \
+            "https://jcenter.bintray.com/de/robv/android/xposed/api/82/api-82.jar" \
+            -o api-82.jar || \
+          curl -fSL -A "Mozilla/5.0" \
+            "https://maven.aliyun.com/repository/public/de/robv/android/xposed/api/82/api-82.jar" \
+            -o api-82.jar
+
           ANDROID_JAR=$(ls -d $ANDROID_HOME/platforms/android-*/android.jar | sort -V | tail -n 1)
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
 
@@ -160,6 +166,7 @@ jobs:
               public void handleLoadPackage(final LoadPackageParam lpparam) throws Throwable {
                   if (!lpparam.packageName.equals("com.gobimbel_online")) return;
 
+                  // Hook Flutter lifecycle channel to keep engine in resumed state
                   Class<?> lifecycleChannel = XposedHelpers.findClassIfExists(
                       "io.flutter.embedding.engine.systemchannels.LifecycleChannel", 
                       lpparam.classLoader
@@ -171,6 +178,7 @@ jobs:
                       XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsDetached", XC_MethodReplacement.DO_NOTHING);
                   }
 
+                  // Force Activity window focus to always report true
                   XposedHelpers.findAndHookMethod(
                       "android.app.Activity", 
                       lpparam.classLoader, 
@@ -184,6 +192,7 @@ jobs:
                       }
                   );
 
+                  // Prevent user leave callback (home button / recents gestures)
                   XposedHelpers.findAndHookMethod(
                       "android.app.Activity", 
                       lpparam.classLoader, 
@@ -205,9 +214,11 @@ jobs:
           </manifest>
           EOF
 
+          # Compile Java -> Dex
           javac -cp "$ANDROID_JAR:api-82.jar" -source 8 -target 8 -d mod_bin mod_src/com/bypass/lifecycle/HookInit.java
           $BUILD_TOOLS/d8 --output . mod_bin/com/bypass/lifecycle/*.class
 
+          # Package and sign the module APK
           $BUILD_TOOLS/aapt2 link -o mod_base.apk -I "$ANDROID_JAR" --manifest mod_manifest.xml
           zip -uj mod_base.apk classes.dex
           echo "com.bypass.lifecycle.HookInit" > mod_assets/xposed_init
