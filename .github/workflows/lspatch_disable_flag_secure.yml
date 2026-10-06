@@ -1,32 +1,21 @@
-name: Rebuild APK with Disable FLAG_SECURE
+name: Rebuild APK with Disable FLAG_SECURE and Anti-Exit
 
 on:
   workflow_dispatch:
     inputs:
       app_id:
-        description: "Android app package (e.g. com.instagram.android or com.app@version)"
+        description: "Android app package (e.g. com.gobimbel_online)"
+        default: "com.gobimbel_online"
         required: false
       apk_url:
-        description: "Direct APK download link (only if you don't use package name)"
+        description: "Direct APK download link (leave empty if using package name)"
         required: false
       download_source:
-        description: "APK download source"
-        required: false
-        default: "google-play"
-        type: choice
-        options:
-          - "google-play"
-          - "apk-pure"
-          - "f-droid"
-          - "huawei-app-gallery"
-      gplay_email:
-        description: "Google Account Email (required if using google-play)"
-        required: false
-      oauth_token:
-        description: "One-time OAuth Token (oauth2_4/...)"
+        description: "APK download source (apk-pure, f-droid, huawei-app-gallery)"
+        default: "apk-pure"
         required: false
       signture_bypass:
-        description: "Signature bypass level (increase if apk has protection) [default: 0]"
+        description: "Signature bypass level [default: 0]"
         default: "0"
         type: choice
         options:
@@ -34,7 +23,7 @@ on:
           - "1"
           - "2"
       injectdex:
-        description: "Inject dex directly (useful if apk is browser)"
+        description: "Inject dex directly"
         default: false
         type: boolean
 
@@ -50,7 +39,7 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Build
+      - name: Build and Patch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -59,107 +48,31 @@ jobs:
           APP_ID="${{ github.event.inputs.app_id }}"
           APK_URL="${{ github.event.inputs.apk_url }}"
           DOWNLOAD_SOURCE="${{ github.event.inputs.download_source }}"
-          GPLAY_EMAIL="${{ github.event.inputs.gplay_email }}"
-          OAUTH_TOKEN="${{ github.event.inputs.oauth_token }}"
           SIGNTURE_BYPASS="${{ github.event.inputs.signture_bypass }}"
           INJECTDEX="${{ github.event.inputs.injectdex }}"
           BASENAME="patched"
 
-          # 1. Fetch LSPatch
+          # 1. Download LSPatch
           LSPATCH_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/JingMatrix/LSPatch/releases \
             | jq -r '.[0].assets[] | select(.name | test(".*\\.jar$")) | .browser_download_url' | head -n 1)
           wget -O lspatch.jar "$LSPATCH_URL"
 
-          # 2. Fetch Xposed Disable FLAG_SECURE Module
+          # 2. Download Module 1: Disable FLAG_SECURE
           MODULE_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/Xposed-Modules-Repo/com.varuns2002.disable_flag_secure/releases \
             | jq -r '.[0].assets[] | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$")) | .browser_download_url' | head -n 1)
           wget -O Xposed-Disable-FLAG_SECURE.apk "$MODULE_URL"
 
-          # 3. Fetch apkeep
-          APKEEP_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/EFForg/apkeep/releases/latest \
-            | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url' | head -n 1)
-          wget -O apkeep "$APKEEP_URL"
-          chmod +x apkeep
+          # 3. Build Module 2: Disable Lifecycle / Anti-Exit APK on the fly
+          echo "Building anti-exit Xposed module..."
+          mkdir -p xposed_build/src/com/bypass/lifecycle
+          mkdir -p xposed_build/assets
+          mkdir -p xposed_build/bin
 
-          # 4. Download Target APK
-          mkdir -p apk_download
-          DOWNLOAD_SOURCE="${DOWNLOAD_SOURCE:-google-play}"
+          echo "com.bypass.lifecycle.HookInit" > xposed_build/assets/xposed_init
 
-          if [ "$DOWNLOAD_SOURCE" = "google-play" ] && [ -n "$OAUTH_TOKEN" ]; then
-            echo "Exchanging one-time OAuth token for AAS session token..."
-            RAW_TOKEN=$(./apkeep -e "$GPLAY_EMAIL" --oauth-token "$OAUTH_TOKEN")
-            AAS_TOKEN=$(echo "$RAW_TOKEN" | grep -oE 'aas_et/[^[:space:]]+' || echo "$RAW_TOKEN" | tail -n 1 | tr -d '[:space:]')
-
-            ./apkeep -a "$APP_ID" -d google-play -e "$GPLAY_EMAIL" -t "$AAS_TOKEN" ./apk_download
-            FILE=$(ls apk_download | head -n 1)
-            BASENAME="${FILE%.*}"
-          elif [ -n "$APP_ID" ]; then
-            ./apkeep -a "$APP_ID" -d "$DOWNLOAD_SOURCE" ./apk_download
-            FILE=$(ls apk_download | head -n 1)
-            BASENAME="${FILE%.*}"
-          elif [ -n "$APK_URL" ]; then
-            wget -O apk_download/input.apk "$APK_URL"
-            BASENAME="app"
-          else
-            echo "No input provided"
-            exit 1
-          fi
-
-          # 5. Extract containers and merge if split APK
-          mkdir -p work_apks raw_extracted
-          for item in apk_download/*; do
-            if [ -f "$item" ]; then
-              case "$item" in
-                *.xapk|*.apks|*.zip)
-                  unzip -qo "$item" -d raw_extracted/
-                  find raw_extracted/ -type f -name "*.apk" -exec mv {} work_apks/ \;
-                  ;;
-                *.apk)
-                  cp "$item" work_apks/
-                  ;;
-              esac
-            fi
-          done
-
-          APK_COUNT=$(find work_apks/ -maxdepth 1 -name "*.apk" | wc -l)
-          if [ "$APK_COUNT" -eq 1 ]; then
-            cp work_apks/*.apk main.apk
-          elif [ "$APK_COUNT" -gt 1 ]; then
-            APKEDITOR_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              https://api.github.com/repos/REAndroid/APKEditor/releases \
-              | jq -r '.[0].assets[] | select(.name | test("^APKEditor-.*\\.jar$")) | .browser_download_url' | head -n 1)
-            wget -O APKEditor.jar "$APKEDITOR_URL"
-            java -jar APKEditor.jar m -i work_apks -o main.apk
-          else
-            echo "Error: No APK files found in work_apks directory."
-            exit 1
-          fi
-
-          # 6. Build the Lifecycle Hook Xposed Module inline
-          echo "=== Building Lifecycle Hook Module ==="
-
-          # Fetch Xposed API 82 from functional mirror
-          curl -fSL -A "Mozilla/5.0" \
-            "https://maven.aliyun.com/repository/public/de/robv/android/xposed/api/82/api-82.jar" \
-            -o api-82.jar || \
-          curl -fSL -A "Mozilla/5.0" \
-            "https://jcenter.bintray.com/de/robv/android/xposed/api/82/api-82.jar" \
-            -o api-82.jar
-
-          # Locate stable Android SDK platform JAR and build tools
-          ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" 2>/dev/null | grep -v "beta" | sort -V | tail -n 1)
-          if [ -z "$ANDROID_JAR" ]; then
-            ANDROID_JAR=$(find "$ANDROID_HOME/platforms" -name "android.jar" 2>/dev/null | sort -V | tail -n 1)
-          fi
-
-          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
-
-          mkdir -p mod_src/com/bypass/lifecycle mod_bin mod_assets
-
-          cat << 'EOF' > mod_src/com/bypass/lifecycle/HookInit.java
+          cat << 'EOF' > xposed_build/src/com/bypass/lifecycle/HookInit.java
           package com.bypass.lifecycle;
 
           import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -173,7 +86,7 @@ jobs:
               public void handleLoadPackage(final LoadPackageParam lpparam) throws Throwable {
                   if (!lpparam.packageName.equals("com.gobimbel_online")) return;
 
-                  // Hook Flutter lifecycle channel to keep engine in resumed state
+                  // Prevent Flutter from sending pause/inactive lifecycle notifications to Dart
                   Class<?> lifecycleChannel = XposedHelpers.findClassIfExists(
                       "io.flutter.embedding.engine.systemchannels.LifecycleChannel", 
                       lpparam.classLoader
@@ -185,7 +98,7 @@ jobs:
                       XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsDetached", XC_MethodReplacement.DO_NOTHING);
                   }
 
-                  // Force Activity window focus to always report true
+                  // Force Android Activity to always report window focus as true
                   XposedHelpers.findAndHookMethod(
                       "android.app.Activity", 
                       lpparam.classLoader, 
@@ -199,7 +112,7 @@ jobs:
                       }
                   );
 
-                  // Prevent user leave callback (home button / recents gestures)
+                  // Block user leave hint (triggered by Home button or app switcher)
                   XposedHelpers.findAndHookMethod(
                       "android.app.Activity", 
                       lpparam.classLoader, 
@@ -210,32 +123,91 @@ jobs:
           }
           EOF
 
-          cat << 'EOF' > mod_manifest.xml
+          cat << 'EOF' > xposed_build/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.bypass.lifecycle">
-              <application android:label="Lifecycle Hook">
-                  <meta-data android:name="xposedmodule" android:value="true"/>
-                  <meta-data android:name="xposeddescription" android:value="Disable lifecycle detection"/>
-                  <meta-data android:name="xposedminversion" android:value="53"/>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.bypass.lifecycle">
+              <application android:label="Disable Lifecycle">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="Prevents exit detection" />
+                  <meta-data android:name="xposedminversion" android:value="54" />
               </application>
           </manifest>
           EOF
 
-          # Compile Java -> Dex
-          javac -cp "$ANDROID_JAR:api-82.jar" -source 8 -target 8 -d mod_bin mod_src/com/bypass/lifecycle/HookInit.java
-          "$BUILD_TOOLS/d8" --output . mod_bin/com/bypass/lifecycle/*.class
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          PLATFORM_JAR=$(ls -d $ANDROID_HOME/platforms/android-* | sort -V | tail -n 1)/android.jar
+          wget -qO xposed-api.jar https://repo.maven.apache.org/maven2/de/robv/android/xposed/api/82/api-82.jar
 
-          # Package and sign the module APK
-          "$BUILD_TOOLS/aapt2" link -o mod_base.apk -I "$ANDROID_JAR" --manifest mod_manifest.xml
-          zip -uj mod_base.apk classes.dex
-          echo "com.bypass.lifecycle.HookInit" > mod_assets/xposed_init
-          (cd mod_assets && zip -u ../mod_base.apk xposed_init)
+          # Compile Java targeting Java 8 bytecode
+          javac -cp "$PLATFORM_JAR:xposed-api.jar" -source 8 -target 8 -d xposed_build/bin xposed_build/src/com/bypass/lifecycle/HookInit.java
 
-          keytool -genkeypair -alias debug -keypass android -keystore debug.keystore -storepass android -dname "CN=Debug" -validity 10000 -keyalg RSA -keysize 2048
-          "$BUILD_TOOLS/apksigner" sign --ks debug.keystore --ks-pass pass:android --out LifecycleHook.apk mod_base.apk
-          rm classes.dex
+          # Convert to DEX using d8
+          $BUILD_TOOLS/d8 xposed_build/bin/com/bypass/lifecycle/*.class --output xposed_build/bin/
 
-          # 7. Run LSPatch with both modules
+          # Package APK and add resources
+          if [ -f "$BUILD_TOOLS/aapt" ]; then
+            $BUILD_TOOLS/aapt package -F xposed_build/module_unaligned.apk -M xposed_build/AndroidManifest.xml -I "$PLATFORM_JAR" -f
+          else
+            $BUILD_TOOLS/aapt2 link -I "$PLATFORM_JAR" --manifest xposed_build/AndroidManifest.xml -o xposed_build/module_unaligned.apk
+          fi
+
+          cd xposed_build/bin && zip -u ../module_unaligned.apk classes.dex && cd ../..
+          cd xposed_build && zip -u -r module_unaligned.apk assets/ && cd ..
+
+          # Sign module APK
+          keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias debug -dname "CN=Debug" -validity 10000 -keyalg RSA -keysize 2048
+          $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --out disable_lifecycle.apk xposed_build/module_unaligned.apk
+
+          # 4. Download Target Package
+          APKEEP_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/EFForg/apkeep/releases/latest \
+            | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url' | head -n 1)
+          wget -O apkeep "$APKEEP_URL"
+          chmod +x apkeep
+
+          mkdir -p apk_download
+          if [ -n "$APP_ID" ]; then
+            if [ -n "$DOWNLOAD_SOURCE" ]; then
+              ./apkeep -a "$APP_ID" -d "$DOWNLOAD_SOURCE" ./apk_download
+            else
+              ./apkeep -a "$APP_ID" ./apk_download
+            fi
+            FILE=$(ls apk_download | head -n 1)
+            BASENAME="${FILE%.*}"
+          elif [ -n "$APK_URL" ]; then
+            wget -O apk_download/input.apk "$APK_URL"
+            BASENAME="app"
+          else
+            echo "No input provided"
+            exit 1
+          fi
+
+          # 5. Extract XAPK/APKS and merge if needed
+          mkdir -p work_apks raw_extracted
+          for item in apk_download/*; do
+            if [ -f "$item" ]; then
+              if unzip -l "$item" 2>/dev/null | grep -q '\.apk$'; then
+                unzip -qo "$item" -d raw_extracted/
+                find raw_extracted/ -type f -name "*.apk" -exec mv {} work_apks/ \;
+              elif [[ "$item" == *.apk ]] || unzip -l "$item" 2>/dev/null | grep -q "AndroidManifest.xml"; then
+                cp "$item" work_apks/
+              fi
+            fi
+          done
+
+          APK_COUNT=$(ls work_apks/*.apk 2>/dev/null | wc -l)
+          if [ "$APK_COUNT" -eq 1 ]; then
+            cp work_apks/*.apk main.apk
+          else
+            APKEDITOR_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/REAndroid/APKEditor/releases \
+              | jq -r '.[0].assets[] | select(.name | test("^APKEditor-.*\\.jar$")) | .browser_download_url' | head -n 1)
+            wget -O APKEditor.jar "$APKEDITOR_URL"
+            java -jar APKEditor.jar m -i work_apks -o main.apk
+          fi
+
+          # 6. Apply LSPatch with BOTH modules
           mkdir -p lspatch
           INJECT_FLAG=""
           if [ "$INJECTDEX" = "true" ]; then
@@ -245,11 +217,10 @@ jobs:
           java -jar lspatch.jar \
             -l "$SIGNTURE_BYPASS" \
             -m Xposed-Disable-FLAG_SECURE.apk \
-            -m LifecycleHook.apk \
+            -m disable_lifecycle.apk \
             $INJECT_FLAG \
             -o lspatch main.apk
 
-          # 8. Rename output
           OUTPUT_FILE=$(ls lspatch/*.apk | head -n 1)
           mv "$OUTPUT_FILE" "lspatch/${BASENAME}_patched.apk"
 
