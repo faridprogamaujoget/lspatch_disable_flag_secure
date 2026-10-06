@@ -51,19 +51,19 @@ jobs:
           INJECTDEX="${{ github.event.inputs.injectdex }}"
           BASENAME="patched"
 
-          # 1. Download LSPatch (handling pre-releases)
+          # 1. Download LSPatch
           LSPATCH_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/JingMatrix/LSPatch/releases \
             | jq -r '.[0].assets[] | select(.name | test(".*\\.jar$")) | .browser_download_url' | head -n 1)
           wget -O lspatch.jar "$LSPATCH_URL"
 
-          # 2. Download Module 1: Disable FLAG_SECURE
+          # 2. Download Disable FLAG_SECURE Module
           MODULE_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/Xposed-Modules-Repo/com.varuns2002.disable_flag_secure/releases \
             | jq -r '.[0].assets[] | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$")) | .browser_download_url' | head -n 1)
           wget -O Xposed-Disable-FLAG_SECURE.apk "$MODULE_URL"
 
-          # 3. Build Module 2: Anti-Exit Xposed Module
+          # 3. Build Anti-Exit Module
           echo "Setting up anti-exit build environment..."
           mkdir -p xposed_build/src/com/bypass/lifecycle
           mkdir -p xposed_build/assets
@@ -72,7 +72,6 @@ jobs:
 
           echo "com.bypass.lifecycle.HookInit" > xposed_build/assets/xposed_init
 
-          # Stubs for Xposed framework
           cat << 'EOF' > xposed_build/stubs/de/robv/android/xposed/callbacks/XC_LoadPackage.java
           package de.robv.android.xposed.callbacks;
           public class XC_LoadPackage {
@@ -139,10 +138,10 @@ jobs:
               public static Class<?> findClassIfExists(String className, ClassLoader classLoader) { return null; }
               public static XC_MethodHook.Unhook findAndHookMethod(Class<?> clazz, String methodName, Object... parameterTypesAndCallback) { return null; }
               public static XC_MethodHook.Unhook findAndHookMethod(String className, ClassLoader classLoader, String methodName, Object... parameterTypesAndCallback) { return null; }
+              public static Object getObjectField(Object obj, String fieldName) { return null; }
           }
           EOF
 
-          # Hook implementation using static nested class to avoid D8 compiler issues
           cat << 'EOF' > xposed_build/src/com/bypass/lifecycle/HookInit.java
           package com.bypass.lifecycle;
 
@@ -154,45 +153,80 @@ jobs:
 
           public class HookInit implements IXposedHookLoadPackage {
 
-              public static class FocusHook extends XC_MethodHook {
+              public static class ForceTrueHook extends XC_MethodHook {
                   @Override
                   protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                      param.args[0] = true;
+                      if (param.args != null && param.args.length > 0 && param.args[0] instanceof Boolean) {
+                          param.args[0] = true;
+                      }
                   }
+              }
+
+              public static class ReturnTrueHook extends XC_MethodHook {
+                  @Override
+                  protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                      param.setResult(true);
+                  }
+              }
+
+              public static class LifecycleMessageFilter extends XC_MethodHook {
+                  @Override
+                  protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                      try {
+                          String channelName = (String) XposedHelpers.getObjectField(param.thisObject, "name");
+                          if ("flutter/lifecycle".equals(channelName)) {
+                              Object msg = param.args[0];
+                              if (msg != null && !msg.toString().contains("resumed")) {
+                                  // Drop all inactive, paused, hidden, detached messages to Dart
+                                  param.setResult(null);
+                              }
+                          }
+                      } catch (Throwable ignored) {}
+                  }
+              }
+
+              private void safeHook(String className, ClassLoader cl, String method, Object... args) {
+                  try {
+                      Class<?> clazz = XposedHelpers.findClassIfExists(className, cl);
+                      if (clazz != null) {
+                          XposedHelpers.findAndHookMethod(clazz, method, args);
+                      }
+                  } catch (Throwable ignored) {}
               }
 
               @Override
               public void handleLoadPackage(final LoadPackageParam lpparam) throws Throwable {
-                  if (!lpparam.packageName.equals("com.gobimbel_online")) return;
+                  if (!"com.gobimbel_online".equals(lpparam.packageName)) return;
+                  final ClassLoader cl = lpparam.classLoader;
 
-                  // Block Flutter engine lifecycle pause/inactive events
-                  Class<?> lifecycleChannel = XposedHelpers.findClassIfExists(
-                      "io.flutter.embedding.engine.systemchannels.LifecycleChannel", 
-                      lpparam.classLoader
-                  );
-                  if (lifecycleChannel != null) {
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsInactive", XC_MethodReplacement.DO_NOTHING);
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsPaused", XC_MethodReplacement.DO_NOTHING);
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsHidden", XC_MethodReplacement.DO_NOTHING);
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsDetached", XC_MethodReplacement.DO_NOTHING);
+                  // 1. Hook Flutter's BasicMessageChannel on 'flutter/lifecycle'
+                  safeHook("io.flutter.plugin.common.BasicMessageChannel", cl, "send", Object.class, new LifecycleMessageFilter());
+
+                  Class<?> replyClass = XposedHelpers.findClassIfExists("io.flutter.plugin.common.BasicMessageChannel$Reply", cl);
+                  if (replyClass != null) {
+                      safeHook("io.flutter.plugin.common.BasicMessageChannel", cl, "send", Object.class, replyClass, new LifecycleMessageFilter());
                   }
 
-                  // Force Android Activity window focus to stay active
-                  XposedHelpers.findAndHookMethod(
-                      "android.app.Activity", 
-                      lpparam.classLoader, 
-                      "onWindowFocusChanged", 
-                      boolean.class, 
-                      new FocusHook()
-                  );
+                  // 2. Hook direct LifecycleChannel triggers
+                  safeHook("io.flutter.embedding.engine.systemchannels.LifecycleChannel", cl, "appIsInactive", XC_MethodReplacement.DO_NOTHING);
+                  safeHook("io.flutter.embedding.engine.systemchannels.LifecycleChannel", cl, "appIsPaused", XC_MethodReplacement.DO_NOTHING);
+                  safeHook("io.flutter.embedding.engine.systemchannels.LifecycleChannel", cl, "appIsHidden", XC_MethodReplacement.DO_NOTHING);
+                  safeHook("io.flutter.embedding.engine.systemchannels.LifecycleChannel", cl, "appIsDetached", XC_MethodReplacement.DO_NOTHING);
 
-                  // Suppress onUserLeaveHint
-                  XposedHelpers.findAndHookMethod(
-                      "android.app.Activity", 
-                      lpparam.classLoader, 
-                      "onUserLeaveHint", 
-                      XC_MethodReplacement.DO_NOTHING
-                  );
+                  // 3. Prevent focus loss across Activity, FlutterActivity, and Flutter delegates
+                  String[] activityTargets = new String[] {
+                      "android.app.Activity",
+                      "io.flutter.embedding.android.FlutterActivity",
+                      "io.flutter.embedding.android.FlutterActivityAndFragmentDelegate",
+                      "com.gobimbel_online.MainActivity"
+                  };
+
+                  for (String target : activityTargets) {
+                      safeHook(target, cl, "onWindowFocusChanged", boolean.class, new ForceTrueHook());
+                      safeHook(target, cl, "onTopResumedActivityChanged", boolean.class, new ForceTrueHook());
+                      safeHook(target, cl, "hasWindowFocus", new ReturnTrueHook());
+                      safeHook(target, cl, "onUserLeaveHint", XC_MethodReplacement.DO_NOTHING);
+                  }
               }
           }
           EOF
@@ -212,15 +246,12 @@ jobs:
           BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
           PLATFORM_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
 
-          # Compile stubs and package into stubs.jar
           mkdir -p xposed_build/stub_bin
           javac -source 8 -target 8 -Xlint:-options -d xposed_build/stub_bin $(find xposed_build/stubs -name "*.java")
           jar cf xposed_build/stubs.jar -C xposed_build/stub_bin .
 
-          # Compile HookInit against stubs.jar + android.jar
           javac -source 8 -target 8 -Xlint:-options -cp "$PLATFORM_JAR:xposed_build/stubs.jar" -d xposed_build/bin xposed_build/src/com/bypass/lifecycle/HookInit.java
 
-          # Dex HookInit with --classpath stubs.jar so D8 resolves the hierarchy
           $BUILD_TOOLS/d8 \
             --lib "$PLATFORM_JAR" \
             --classpath xposed_build/stubs.jar \
@@ -228,17 +259,15 @@ jobs:
             xposed_build/bin/com/bypass/lifecycle/*.class \
             --output xposed_build/bin/
 
-          # Package APK
           $BUILD_TOOLS/aapt package -F xposed_build/module_unaligned.apk -M xposed_build/AndroidManifest.xml -I "$PLATFORM_JAR" -f
           (cd xposed_build/bin && zip -u ../module_unaligned.apk classes.dex)
           (cd xposed_build && zip -u -r module_unaligned.apk assets/)
 
-          # Sign module APK
           rm -f debug.keystore
           keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias debug -dname "CN=Debug" -validity 10000 -keyalg RSA -keysize 2048
           $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --out disable_lifecycle.apk xposed_build/module_unaligned.apk
 
-          # 4. Download Target Package (APK_URL TAKES PRIORITY)
+          # 4. Download Target Package
           mkdir -p apk_download
           if [ -n "$APK_URL" ]; then
             echo "Direct APK link detected: $APK_URL"
@@ -288,7 +317,7 @@ jobs:
             java -jar APKEditor.jar m -i work_apks -o main.apk
           fi
 
-          # 6. Apply LSPatch with BOTH modules
+          # 6. Apply LSPatch with both modules
           mkdir -p lspatch
           INJECT_FLAG=""
           if [ "$INJECTDEX" = "true" ]; then
