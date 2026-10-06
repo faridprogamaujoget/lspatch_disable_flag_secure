@@ -3,15 +3,15 @@ name: Rebuild APK with Disable FLAG_SECURE and Anti-Exit
 on:
   workflow_dispatch:
     inputs:
-      app_id:
-        description: "Android app package (e.g. com.gobimbel_online)"
-        default: "com.gobimbel_online"
-        required: false
       apk_url:
-        description: "Direct APK download link (leave empty if using package name)"
+        description: "Direct APK download link (takes priority)"
+        required: false
+      app_id:
+        description: "Android app package (e.g. com.gobimbel_online - only if not using link)"
         required: false
       download_source:
         description: "APK download source (apk-pure, f-droid, huawei-app-gallery)"
+        default: "apk-pure"
         required: false
       signture_bypass:
         description: "Signature bypass level [default: 0]"
@@ -142,7 +142,7 @@ jobs:
           }
           EOF
 
-          # Hook implementation using static nested class to avoid anonymous inner class issues
+          # Hook implementation using static nested class to avoid D8 compiler issues
           cat << 'EOF' > xposed_build/src/com/bypass/lifecycle/HookInit.java
           package com.bypass.lifecycle;
 
@@ -212,15 +212,15 @@ jobs:
           BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
           PLATFORM_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
 
-          # 1. Compile stubs and package into stubs.jar
+          # Compile stubs and package into stubs.jar
           mkdir -p xposed_build/stub_bin
           javac -source 8 -target 8 -Xlint:-options -d xposed_build/stub_bin $(find xposed_build/stubs -name "*.java")
           jar cf xposed_build/stubs.jar -C xposed_build/stub_bin .
 
-          # 2. Compile HookInit against stubs.jar + android.jar
+          # Compile HookInit against stubs.jar + android.jar
           javac -source 8 -target 8 -Xlint:-options -cp "$PLATFORM_JAR:xposed_build/stubs.jar" -d xposed_build/bin xposed_build/src/com/bypass/lifecycle/HookInit.java
 
-          # 3. Dex HookInit with --classpath stubs.jar so D8 can resolve the hierarchy
+          # Dex HookInit with --classpath stubs.jar so D8 resolves the hierarchy
           $BUILD_TOOLS/d8 \
             --lib "$PLATFORM_JAR" \
             --classpath xposed_build/stubs.jar \
@@ -228,25 +228,30 @@ jobs:
             xposed_build/bin/com/bypass/lifecycle/*.class \
             --output xposed_build/bin/
 
-          # 4. Package APK
+          # Package APK
           $BUILD_TOOLS/aapt package -F xposed_build/module_unaligned.apk -M xposed_build/AndroidManifest.xml -I "$PLATFORM_JAR" -f
           (cd xposed_build/bin && zip -u ../module_unaligned.apk classes.dex)
           (cd xposed_build && zip -u -r module_unaligned.apk assets/)
 
-          # 5. Sign module APK
+          # Sign module APK
           rm -f debug.keystore
           keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias debug -dname "CN=Debug" -validity 10000 -keyalg RSA -keysize 2048
           $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --out disable_lifecycle.apk xposed_build/module_unaligned.apk
 
-          # 6. Download Target Package
-          APKEEP_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/EFForg/apkeep/releases/latest \
-            | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url' | head -n 1)
-          wget -O apkeep "$APKEEP_URL"
-          chmod +x apkeep
-
+          # 4. Download Target Package (APK_URL TAKES PRIORITY)
           mkdir -p apk_download
-          if [ -n "$APP_ID" ]; then
+          if [ -n "$APK_URL" ]; then
+            echo "Direct APK link detected: $APK_URL"
+            wget -O apk_download/input.apk "$APK_URL"
+            BASENAME="app"
+          elif [ -n "$APP_ID" ]; then
+            echo "App package ID detected: $APP_ID"
+            APKEEP_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/EFForg/apkeep/releases/latest \
+              | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url' | head -n 1)
+            wget -O apkeep "$APKEEP_URL"
+            chmod +x apkeep
+
             if [ -n "$DOWNLOAD_SOURCE" ]; then
               ./apkeep -a "$APP_ID" -d "$DOWNLOAD_SOURCE" ./apk_download
             else
@@ -254,15 +259,12 @@ jobs:
             fi
             FILE=$(ls apk_download | head -n 1)
             BASENAME="${FILE%.*}"
-          elif [ -n "$APK_URL" ]; then
-            wget -O apk_download/input.apk "$APK_URL"
-            BASENAME="app"
           else
-            echo "No input provided"
+            echo "Error: Neither apk_url nor app_id was provided."
             exit 1
           fi
 
-          # 7. Extract XAPK/APKS and merge if needed
+          # 5. Extract XAPK/APKS and merge if needed
           mkdir -p work_apks raw_extracted
           for item in apk_download/*; do
             if [ -f "$item" ]; then
@@ -286,7 +288,7 @@ jobs:
             java -jar APKEditor.jar m -i work_apks -o main.apk
           fi
 
-          # 8. Apply LSPatch with BOTH modules
+          # 6. Apply LSPatch with BOTH modules
           mkdir -p lspatch
           INJECT_FLAG=""
           if [ "$INJECTDEX" = "true" ]; then
