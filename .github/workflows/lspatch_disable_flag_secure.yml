@@ -73,7 +73,7 @@ jobs:
 
           echo "com.bypass.lifecycle.HookInit" > xposed_build/assets/xposed_init
 
-          # Create compile-time Xposed stubs (zero network downloads required)
+          # Stubs for Xposed framework
           cat << 'EOF' > xposed_build/stubs/de/robv/android/xposed/callbacks/XC_LoadPackage.java
           package de.robv.android.xposed.callbacks;
           public class XC_LoadPackage {
@@ -104,6 +104,8 @@ jobs:
                   public void setResult(Object result) { this.result = result; }
               }
               public static class Unhook {}
+              public XC_MethodHook() {}
+              public XC_MethodHook(int priority) {}
               protected void beforeHookedMethod(MethodHookParam param) throws Throwable {}
               protected void afterHookedMethod(MethodHookParam param) throws Throwable {}
           }
@@ -118,6 +120,8 @@ jobs:
                       return null;
                   }
               };
+              public XC_MethodReplacement() {}
+              public XC_MethodReplacement(int priority) {}
               @Override
               protected final void beforeHookedMethod(MethodHookParam param) throws Throwable {
                   try {
@@ -139,7 +143,7 @@ jobs:
           }
           EOF
 
-          # Hook implementation
+          # Hook implementation using static nested class to avoid anonymous inner class issues
           cat << 'EOF' > xposed_build/src/com/bypass/lifecycle/HookInit.java
           package com.bypass.lifecycle;
 
@@ -150,6 +154,14 @@ jobs:
           import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
           public class HookInit implements IXposedHookLoadPackage {
+
+              public static class FocusHook extends XC_MethodHook {
+                  @Override
+                  protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                      param.args[0] = true;
+                  }
+              }
+
               @Override
               public void handleLoadPackage(final LoadPackageParam lpparam) throws Throwable {
                   if (!lpparam.packageName.equals("com.gobimbel_online")) return;
@@ -172,12 +184,7 @@ jobs:
                       lpparam.classLoader, 
                       "onWindowFocusChanged", 
                       boolean.class, 
-                      new XC_MethodHook() {
-                          @Override
-                          protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                              param.args[0] = true;
-                          }
-                      }
+                      new FocusHook()
                   );
 
                   // Suppress onUserLeaveHint
@@ -203,19 +210,24 @@ jobs:
           </manifest>
           EOF
 
-          # Select stable Android 34 build-tools and platform
           BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
           PLATFORM_JAR="$ANDROID_HOME/platforms/android-34/android.jar"
 
-          # 1. Compile stubs
+          # 1. Compile stubs and package into stubs.jar
           mkdir -p xposed_build/stub_bin
-          javac -source 8 -target 8 -d xposed_build/stub_bin $(find xposed_build/stubs -name "*.java")
+          javac -source 8 -target 8 -Xlint:-options -d xposed_build/stub_bin $(find xposed_build/stubs -name "*.java")
+          jar cf xposed_build/stubs.jar -C xposed_build/stub_bin .
 
-          # 2. Compile HookInit against stubs + android.jar
-          javac -source 8 -target 8 -cp "$PLATFORM_JAR:xposed_build/stub_bin" -d xposed_build/bin xposed_build/src/com/bypass/lifecycle/HookInit.java
+          # 2. Compile HookInit against stubs.jar + android.jar
+          javac -source 8 -target 8 -Xlint:-options -cp "$PLATFORM_JAR:xposed_build/stubs.jar" -d xposed_build/bin xposed_build/src/com/bypass/lifecycle/HookInit.java
 
-          # 3. Dex only HookInit (stubs are omitted from dex)
-          $BUILD_TOOLS/d8 --lib "$PLATFORM_JAR" xposed_build/bin/com/bypass/lifecycle/*.class --output xposed_build/bin/
+          # 3. Dex HookInit with --classpath stubs.jar so D8 can resolve the hierarchy
+          $BUILD_TOOLS/d8 \
+            --lib "$PLATFORM_JAR" \
+            --classpath xposed_build/stubs.jar \
+            --min-api 26 \
+            xposed_build/bin/com/bypass/lifecycle/*.class \
+            --output xposed_build/bin/
 
           # 4. Package APK
           $BUILD_TOOLS/aapt package -F xposed_build/module_unaligned.apk -M xposed_build/AndroidManifest.xml -I "$PLATFORM_JAR" -f
@@ -227,7 +239,7 @@ jobs:
           keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias debug -dname "CN=Debug" -validity 10000 -keyalg RSA -keysize 2048
           $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --out disable_lifecycle.apk xposed_build/module_unaligned.apk
 
-          # 4. Download Target Package
+          # 6. Download Target Package
           APKEEP_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/EFForg/apkeep/releases/latest \
             | jq -r '.assets[] | select(.name=="apkeep-x86_64-unknown-linux-gnu") | .browser_download_url' | head -n 1)
@@ -251,7 +263,7 @@ jobs:
             exit 1
           fi
 
-          # 5. Extract XAPK/APKS and merge if needed
+          # 7. Extract XAPK/APKS and merge if needed
           mkdir -p work_apks raw_extracted
           for item in apk_download/*; do
             if [ -f "$item" ]; then
@@ -275,7 +287,7 @@ jobs:
             java -jar APKEditor.jar m -i work_apks -o main.apk
           fi
 
-          # 6. Apply LSPatch with BOTH modules
+          # 8. Apply LSPatch with BOTH modules
           mkdir -p lspatch
           INJECT_FLAG=""
           if [ "$INJECTDEX" = "true" ]; then
