@@ -55,7 +55,7 @@ jobs:
             https://api.github.com/repos/JingMatrix/LSPatch/releases \
             | jq -r '.[0].assets[] | select(.name | test(".*\\.jar$")) | .browser_download_url' | head -n 1)
 
-          if [ -z "$LSPATCH_URL" ] || [ "$LSPATCH_URL" = "null" ]; then
+          if [ -z "$LSPATCH_URL" ] \vert{}\vert{} [ "$LSPATCH_URL" = "null" ]; then
             echo "Failed to resolve LSPATCH_URL"
             exit 1
           fi
@@ -66,7 +66,7 @@ jobs:
             https://api.github.com/repos/Xposed-Modules-Repo/com.varuns2002.disable_flag_secure/releases \
             | jq -r '.[0].assets[] | select(.name | test("^Xposed-Disable-FLAG_SECURE_.*\\.apk$")) | .browser_download_url' | head -n 1)
 
-          if [ -z "$MODULE_URL" ] || [ "$MODULE_URL" = "null" ]; then
+          if [ -z "$MODULE_URL" ] \vert{}\vert{} [ "$MODULE_URL" = "null" ]; then
             echo "Failed to resolve MODULE_URL"
             exit 1
           fi
@@ -84,8 +84,12 @@ jobs:
           mkdir -p apk_download
           if [ -n "$APP_ID" ]; then
             SRC="${DOWNLOAD_SOURCE:-apk-pure}"
-            echo "Fetching $APP_ID from source: $SRC"
-            ./apkeep --accept-danger-warning -a "$APP_ID" -d "$SRC" ./apk_download
+            echo "Fetching $APP_ID from source:$SRC"
+
+            export APKEEP_APKPURE_DANGERS_ACKNOWLEDGED=true
+            export APKPURE_DANGERS_ACKNOWLEDGED=true
+
+            ./apkeep -a "$APP_ID" -d "$SRC" ./apk_download
             FILE=$(ls apk_download | head -n 1)
             BASENAME="${FILE%.*}"
           elif [ -n "$APK_URL" ]; then
@@ -105,131 +109,4 @@ jobs:
           mkdir -p work_apks raw_extracted
           for item in apk_download/*; do
             if [ -f "$item" ]; then
-              if unzip -l "$item" 2>/dev/null | grep -q '\.apk$'; then
-                unzip -qo "$item" -d raw_extracted/
-                find raw_extracted/ -type f -name "*.apk" -exec mv {} work_apks/ \;
-              elif [[ "$item" == *.apk ]] || unzip -l "$item" 2>/dev/null | grep -q "AndroidManifest.xml"; then
-                cp "$item" work_apks/
-              fi
-            fi
-          done
-
-          APK_COUNT=$(ls work_apks/*.apk 2>/dev/null | wc -l)
-          if [ "$APK_COUNT" -eq 0 ]; then
-            echo "No valid APK files found in download"
-            exit 1
-          elif [ "$APK_COUNT" -eq 1 ]; then
-            cp work_apks/*.apk main.apk
-          else
-            APKEDITOR_URL=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              https://api.github.com/repos/REAndroid/APKEditor/releases \
-              | jq -r '.[0].assets[] | select(.name | test("^APKEditor-.*\\.jar$")) | .browser_download_url' | head -n 1)
-            wget -O APKEditor.jar "$APKEDITOR_URL"
-            java -jar APKEditor.jar m -i work_apks -o main.apk
-          fi
-
-          # 6. Build the Lifecycle Hook Xposed Module inline
-          echo "=== Building Lifecycle Hook Module ==="
-          wget -q -O api-82.jar "https://repo1.maven.org/maven2/de/robv/android/xposed/api/82/api-82.jar"
-          ANDROID_JAR=$(ls -d $ANDROID_HOME/platforms/android-*/android.jar | sort -V | tail -n 1)
-          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
-
-          mkdir -p mod_src/com/bypass/lifecycle mod_bin mod_assets
-
-          cat << 'EOF' > mod_src/com/bypass/lifecycle/HookInit.java
-          package com.bypass.lifecycle;
-
-          import de.robv.android.xposed.IXposedHookLoadPackage;
-          import de.robv.android.xposed.XC_MethodHook;
-          import de.robv.android.xposed.XC_MethodReplacement;
-          import de.robv.android.xposed.XposedHelpers;
-          import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
-
-          public class HookInit implements IXposedHookLoadPackage {
-              @Override
-              public void handleLoadPackage(final LoadPackageParam lpparam) throws Throwable {
-                  if (!lpparam.packageName.equals("com.gobimbel_online")) return;
-
-                  // Hook Flutter lifecycle channel to keep engine in resumed state
-                  Class<?> lifecycleChannel = XposedHelpers.findClassIfExists(
-                      "io.flutter.embedding.engine.systemchannels.LifecycleChannel", 
-                      lpparam.classLoader
-                  );
-                  if (lifecycleChannel != null) {
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsInactive", XC_MethodReplacement.DO_NOTHING);
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsPaused", XC_MethodReplacement.DO_NOTHING);
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsHidden", XC_MethodReplacement.DO_NOTHING);
-                      XposedHelpers.findAndHookMethod(lifecycleChannel, "appIsDetached", XC_MethodReplacement.DO_NOTHING);
-                  }
-
-                  // Force Activity window focus to always report true
-                  XposedHelpers.findAndHookMethod(
-                      "android.app.Activity", 
-                      lpparam.classLoader, 
-                      "onWindowFocusChanged", 
-                      boolean.class, 
-                      new XC_MethodHook() {
-                          @Override
-                          protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                              param.args[0] = true;
-                          }
-                      }
-                  );
-
-                  // Prevent user leave callback (home button / recents gestures)
-                  XposedHelpers.findAndHookMethod(
-                      "android.app.Activity", 
-                      lpparam.classLoader, 
-                      "onUserLeaveHint", 
-                      XC_MethodReplacement.DO_NOTHING
-                  );
-              }
-          }
-          EOF
-
-          cat << 'EOF' > mod_manifest.xml
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.bypass.lifecycle">
-              <application android:label="Lifecycle Hook">
-                  <meta-data android:name="xposedmodule" android:value="true"/>
-                  <meta-data android:name="xposeddescription" android:value="Disable lifecycle detection"/>
-                  <meta-data android:name="xposedminversion" android:value="53"/>
-              </application>
-          </manifest>
-          EOF
-
-          javac -cp "$ANDROID_JAR:api-82.jar" -source 8 -target 8 -d mod_bin mod_src/com/bypass/lifecycle/HookInit.java
-          $BUILD_TOOLS/d8 --output . mod_bin/com/bypass/lifecycle/*.class
-
-          $BUILD_TOOLS/aapt2 link -o mod_base.apk -I "$ANDROID_JAR" --manifest mod_manifest.xml
-          zip -uj mod_base.apk classes.dex
-          echo "com.bypass.lifecycle.HookInit" > mod_assets/xposed_init
-          (cd mod_assets && zip -u ../mod_base.apk xposed_init)
-
-          keytool -genkeypair -alias debug -keypass android -keystore debug.keystore -storepass android -dname "CN=Debug" -validity 10000 -keyalg RSA -keysize 2048
-          $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --out LifecycleHook.apk mod_base.apk
-          rm classes.dex
-
-          # 7. Run LSPatch with both modules
-          mkdir -p lspatch
-          INJECT_FLAG=""
-          if [ "$INJECTDEX" = "true" ]; then
-            INJECT_FLAG="--injectdex"
-          fi
-
-          java -jar lspatch.jar \
-            -l "$SIGNTURE_BYPASS" \
-            -m Xposed-Disable-FLAG_SECURE.apk \
-            -m LifecycleHook.apk \
-            $INJECT_FLAG \
-            -o lspatch main.apk
-
-          # 8. Rename output
-          OUTPUT_FILE=$(ls lspatch/*.apk | head -n 1)
-          mv "$OUTPUT_FILE" "lspatch/${BASENAME}_patched.apk"
-
-      - name: Upload patched APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: patched-apk
-          path: "lspatch/*.apk"
+              if unzip -l "$item" 2>/dev/null | grep
